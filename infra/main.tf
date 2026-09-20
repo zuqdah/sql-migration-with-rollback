@@ -8,6 +8,15 @@ resource "random_string" "suffix" {
   upper   = false
   numeric = true
   special = false
+
+  keepers = {
+    # Azure reserves a SQL server name against the region it was first created
+    # in, and keeps the reservation even when that creation failed. Moving the
+    # server to another region therefore has to move it to another name, or
+    # the create fails with InvalidResourceLocation against a resource that
+    # does not appear in the resource group at all.
+    location = coalesce(var.location, data.azurerm_resource_group.lab.location)
+  }
 }
 
 locals {
