@@ -4,7 +4,11 @@ variable "resource_group_name" {
 }
 
 variable "location" {
-  description = "Region override. Defaults to the resource group's region."
+  # Azure SQL provisioning is restricted per subscription per region, and the
+  # restriction is invisible until apply fails with ProvisioningDisabled. The
+  # capabilities API reports it up front: a region whose status is "Visible"
+  # rather than "Available" will refuse to provision. See the README.
+  description = "Region for the SQL server. Must be a region where this subscription may provision SQL; defaults to the resource group's region."
   type        = string
   default     = null
 }

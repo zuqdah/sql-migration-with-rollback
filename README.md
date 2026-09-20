@@ -130,11 +130,19 @@ Serverless auto-pauses after an hour of inactivity, so a forgotten database stop
 - **The drill restores alongside, not over.** It imports into a database of its own, so it can run after a successful cutover without touching live data, and it clears any remnant of an earlier run first so the drill is repeatable.
 - **The source is a container, not a VM.** It costs nothing, it is identical on every run, and it makes the whole pipeline testable in CI without an Azure subscription.
 
-### Three things that only surface against real systems
+### Four things that only surface against real systems
 
 - `RowCount` is a reserved word in T-SQL. Unquoted, the snapshot query fails with a syntax error that points at the wrong place.
 - `sqlpackage` targets .NET 8 and the runners carry .NET 9. `DOTNET_ROLL_FORWARD=Major` is cheaper than installing a second runtime on every job.
 - ADO.NET keeps a pooled connection open after the last query returns, which holds the database and makes `DROP DATABASE` fail. Clearing the pool is the portable fix; `SINGLE_USER` is not available on Azure SQL.
+- Azure SQL provisioning is restricted **per subscription, per region**, and nothing in a plan reveals it — `terraform apply` fails with `ProvisioningDisabled` after the resource group already exists. The capabilities API answers it before you spend the time:
+
+  ```bash
+  az rest --method get --url "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Sql/locations/centralus/capabilities?api-version=2023-08-01" \
+    --query "status"
+  ```
+
+  A region reporting `Visible` rather than `Available` will refuse to provision. On this subscription eastus2, eastus and northcentralus were `Visible`; centralus, westus2, westus3, southcentralus and canadacentral were `Available`. That is why the region is a variable rather than inherited from the resource group.
 
 ## Part of a series
 
