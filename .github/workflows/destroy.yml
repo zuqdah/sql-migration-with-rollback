@@ -1,0 +1,103 @@
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type "destroy" to remove every lab resource.
+        required: true
+  # Nightly teardown at 07:00 UTC. With nothing deployed this finishes in
+  # seconds; with something deployed it stops a forgotten database billing.
+  schedule:
+    - cron: "0 7 * * *"
+
+concurrency:
+  group: sqlmig-infra
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+
+jobs:
+  destroy:
+    name: Terraform destroy
+    # Skips cleanly until the repository is connected to Azure.
+    if: vars.AZURE_CLIENT_ID != '' && (github.event_name == 'schedule' || inputs.confirm == 'destroy')
+    runs-on: ubuntu-latest
+    environment: lab
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::$ARM_CLIENT_ID"
+          echo "::add-mask::$ARM_TENANT_ID"
+          echo "::add-mask::$ARM_SUBSCRIPTION_ID"
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Init
+        working-directory: infra
+        run: >-
+          terraform init -input=false
+          -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}"
+          -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+          -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}"
+          -backend-config="key=infra.tfstate"
+
+      - name: Destroy
+        working-directory: infra
+        run: >-
+          terraform destroy -input=false -auto-approve -lock-timeout=5m
+          -var="resource_group_name=${{ vars.LAB_RESOURCE_GROUP }}"
+          -var="sql_admin_group_name=${{ vars.SQL_ADMIN_GROUP_NAME }}"
+          -var="sql_admin_group_object_id=${{ vars.SQL_ADMIN_GROUP_OBJECT_ID }}"
+
+      # A rollback drill creates a database outside Terraform's state. If a run
+      # failed before its cleanup, the drill database would survive the destroy
+      # and keep billing storage.
+      - name: Sweep databases Terraform does not track
+        if: always()
+        run: |
+          RG="${{ vars.LAB_RESOURCE_GROUP }}"
+          SERVERS="$(az sql server list --resource-group "$RG" --query "[].name" -o tsv 2>/dev/null || true)"
+          if [ -z "$SERVERS" ]; then
+            echo "No SQL servers remain."
+            exit 0
+          fi
+          for s in $SERVERS; do
+            echo "Server $s still present; removing it and anything on it."
+            az sql server delete --resource-group "$RG" --name "$s" --yes >/dev/null 2>&1 || true
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          RG="${{ vars.LAB_RESOURCE_GROUP }}"
+          COUNT="$(az resource list --resource-group "$RG" --query "length(@)" -o tsv 2>/dev/null || echo unknown)"
+          {
+            echo "### Teardown"
+            echo ""
+            echo "Resources remaining in \`$RG\`: **$COUNT**"
+          } >> "$GITHUB_STEP_SUMMARY"

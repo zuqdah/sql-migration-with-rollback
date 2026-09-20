@@ -1,0 +1,9 @@
+out/
+*.bacpac
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfplan
+*.tfvars
+!*.tfvars.example
+crash.log

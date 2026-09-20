@@ -1,0 +1,18 @@
+directory:
+  - .
+quiet: true
+compact: true
+skip-check:
+  # CKV_GHA_7 wants workflow_dispatch to take no inputs. Here the inputs are
+  # the safety mechanism: Migrate defaults to assess-and-plan and will not
+  # write to Azure unless apply is set, and Destroy refuses to run unless the
+  # operator types "destroy". Removing them would make both workflows more
+  # dangerous, not less.
+  - CKV_GHA_7
+  # A customer-managed key would outlive the resources it protects in a lab
+  # that is destroyed after every run.
+  - CKV2_AZURE_1
+  # Blob read logging on the state account would cost more than the state it
+  # records, which describes a lab rebuilt from source on demand. This is a
+  # graph check, so it is skipped here rather than inline on the resource.
+  - CKV2_AZURE_21

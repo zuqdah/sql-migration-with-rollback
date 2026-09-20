@@ -1,0 +1,233 @@
+name: Migrate
+
+# Manual only. Nothing here spends money on a push.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Write to Azure. Leave false to assess and plan only.
+        type: boolean
+        default: false
+
+concurrency:
+  group: sqlmig-infra
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_VERSION: "1.16.3"
+  DOTNET_ROLL_FORWARD: Major
+
+jobs:
+  migrate:
+    name: Migrate to Azure SQL and prove it
+    runs-on: ubuntu-latest
+    environment: lab
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARM_USE_OIDC: "true"
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Mask identifiers
+        run: |
+          echo "::add-mask::$ARM_CLIENT_ID"
+          echo "::add-mask::$ARM_TENANT_ID"
+          echo "::add-mask::$ARM_SUBSCRIPTION_ID"
+
+      # The source stands in for something that already exists elsewhere. It is
+      # a throwaway container with a password generated here, so no credential
+      # lives in the repository.
+      - name: Start and seed the source database
+        run: |
+          SA_PASSWORD="$(openssl rand -base64 24 | tr -d /+= | head -c 24)aA1!"
+          echo "::add-mask::$SA_PASSWORD"
+          echo "SA_PASSWORD=$SA_PASSWORD" >> "$GITHUB_ENV"
+          docker run -d --name srcsql \
+            -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$SA_PASSWORD" -e MSSQL_PID=Developer \
+            -p 1433:1433 mcr.microsoft.com/mssql/server:2022-latest
+          for i in $(seq 1 30); do
+            if docker exec srcsql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -Q "SELECT 1" >/dev/null 2>&1; then
+              echo "SQL Server ready after $(( i * 5 ))s or less"
+              docker cp source/01-schema.sql srcsql:/tmp/01.sql
+              docker cp source/02-seed.sql   srcsql:/tmp/02.sql
+              docker exec srcsql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -b -i /tmp/01.sql
+              docker exec srcsql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -C -b -i /tmp/02.sql
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::SQL Server never became ready"
+          exit 1
+
+      - name: Install tooling
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module SqlServer -Force -AllowClobber
+          dotnet tool install -g microsoft.sqlpackage
+          "$HOME/.dotnet/tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # Nothing is provisioned until the source is known to be migratable. An
+      # assessment that runs after the bill has started is a report, not a gate.
+      - name: Assess before provisioning anything
+        shell: pwsh
+        run: |
+          $secure = ConvertTo-SecureString $env:SA_PASSWORD -AsPlainText -Force
+          $cred = [pscredential]::new('sa', $secure)
+          ./scripts/Get-DatabaseFacts.ps1 -ServerInstance 'localhost,1433' -Database AppDb -Credential $cred -TrustServerCertificate -OutFile out/source-facts.json
+          ./scripts/Invoke-Assessment.ps1 -FactsPath out/source-facts.json -OutFile out/assessment.json
+
+      - name: Export the rollback artifact
+        shell: pwsh
+        run: |
+          $secure = ConvertTo-SecureString $env:SA_PASSWORD -AsPlainText -Force
+          $cred = [pscredential]::new('sa', $secure)
+          ./scripts/Export-Bacpac.ps1 -ServerInstance 'localhost,1433' -Database AppDb -Credential $cred -TrustServerCertificate -OutFile out/AppDb.bacpac
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Init
+        working-directory: infra
+        run: >-
+          terraform init -input=false
+          -backend-config="resource_group_name=${{ vars.TFSTATE_RESOURCE_GROUP }}"
+          -backend-config="storage_account_name=${{ vars.TFSTATE_STORAGE_ACCOUNT }}"
+          -backend-config="container_name=${{ vars.TFSTATE_CONTAINER }}"
+          -backend-config="key=infra.tfstate"
+
+      - name: Plan
+        working-directory: infra
+        run: >-
+          terraform plan -input=false -lock-timeout=5m
+          -var="resource_group_name=${{ vars.LAB_RESOURCE_GROUP }}"
+          -var="sql_admin_group_name=${{ vars.SQL_ADMIN_GROUP_NAME }}"
+          -var="sql_admin_group_object_id=${{ vars.SQL_ADMIN_GROUP_OBJECT_ID }}"
+
+      - name: Apply
+        if: ${{ inputs.apply }}
+        working-directory: infra
+        run: >-
+          terraform apply -input=false -auto-approve -lock-timeout=5m
+          -var="resource_group_name=${{ vars.LAB_RESOURCE_GROUP }}"
+          -var="sql_admin_group_name=${{ vars.SQL_ADMIN_GROUP_NAME }}"
+          -var="sql_admin_group_object_id=${{ vars.SQL_ADMIN_GROUP_OBJECT_ID }}"
+
+      - name: Collect outputs
+        if: ${{ inputs.apply }}
+        id: tf
+        working-directory: infra
+        run: |
+          {
+            echo "server=$(terraform output -raw sql_server_name)"
+            echo "fqdn=$(terraform output -raw sql_server_fqdn)"
+            echo "database=$(terraform output -raw database_name)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Terraform leaves the server with no firewall rules at all. The pinhole
+      # is opened for this runner only and closed in the same run, so the
+      # server is never reachable between deployments.
+      - name: Open a firewall pinhole for this runner
+        if: ${{ inputs.apply }}
+        run: |
+          RUNNER_IP="$(curl -fsS https://api.ipify.org)"
+          echo "::add-mask::$RUNNER_IP"
+          echo "FW_RULE=gh-runner-${{ github.run_id }}" >> "$GITHUB_ENV"
+          az sql server firewall-rule create \
+            --resource-group "${{ vars.LAB_RESOURCE_GROUP }}" \
+            --server "${{ steps.tf.outputs.server }}" \
+            --name "gh-runner-${{ github.run_id }}" \
+            --start-ip-address "$RUNNER_IP" --end-ip-address "$RUNNER_IP" >/dev/null
+          echo "Pinhole open for this runner only."
+
+      - name: Migrate into Azure SQL and prove parity
+        if: ${{ inputs.apply }}
+        shell: pwsh
+        env:
+          FQDN: ${{ steps.tf.outputs.fqdn }}
+          TARGET_DB: ${{ steps.tf.outputs.database }}
+        run: |
+          # The server has no SQL logins at all; Entra is the only way in.
+          $token = az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+          if (-not $token) { throw 'Could not obtain a Dataverse-scope token for Azure SQL.' }
+
+          ./scripts/Import-Bacpac.ps1 -ServerInstance $env:FQDN -Database $env:TARGET_DB -BacpacPath out/AppDb.bacpac -AccessToken $token -ServiceObjective GP_S_Gen5_1
+          ./scripts/Get-DatabaseFacts.ps1 -ServerInstance $env:FQDN -Database $env:TARGET_DB -AccessToken $token -OutFile out/target-facts.json
+          ./scripts/Test-MigrationParity.ps1 -SourceFacts out/source-facts.json -TargetFacts out/target-facts.json -OutFile out/parity.json
+
+      # The migration is only half the story. This restores the artifact taken
+      # before cutover and proves it still matches, on the cloud target.
+      - name: Rollback drill on the Azure target
+        if: ${{ inputs.apply }}
+        shell: pwsh
+        env:
+          FQDN: ${{ steps.tf.outputs.fqdn }}
+        run: |
+          $token = az account get-access-token --resource https://database.windows.net/ --query accessToken -o tsv
+          ./scripts/Invoke-RollbackDrill.ps1 -ServerInstance $env:FQDN -BacpacPath out/AppDb.bacpac -SourceFacts out/source-facts.json -AccessToken $token -ServiceObjective GP_S_Gen5_1 -OutFile out/rollback-parity.json
+
+      # Always: a failed migration must not leave the server reachable.
+      - name: Close the pinhole
+        if: always()
+        run: |
+          if [ -n "${FW_RULE:-}" ] && [ -n "${{ steps.tf.outputs.server }}" ]; then
+            az sql server firewall-rule delete \
+              --resource-group "${{ vars.LAB_RESOURCE_GROUP }}" \
+              --server "${{ steps.tf.outputs.server }}" \
+              --name "$FW_RULE" >/dev/null 2>&1 && echo "Pinhole closed." || echo "No pinhole to close."
+          else
+            echo "No pinhole was opened."
+          fi
+
+      - name: Summary
+        if: always()
+        shell: pwsh
+        run: |
+          "### Migration to Azure SQL" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          "" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          if (Test-Path out/assessment.json) {
+            $a = Get-Content out/assessment.json -Raw | ConvertFrom-Json
+            "Assessment: **$($a.Blocking)** blocking, **$($a.Warning)** warnings across $($a.Tables) tables." | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
+          if (Test-Path out/parity.json) {
+            $p = Get-Content out/parity.json -Raw | ConvertFrom-Json
+            "" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            "Parity: **$($p.RowsSource)** rows across **$($p.TablesSource)** tables migrated with **$($p.Differences.Count)** differences." | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
+          if (Test-Path out/rollback-parity.json) {
+            "" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            "The pre-migration artifact was restored on the Azure target and verified against the source." | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
+          if ('${{ inputs.apply }}' -ne 'true') {
+            "" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            "_Planned only; nothing was written to Azure._" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: migration-evidence
+          path: |
+            out/source-facts.json
+            out/target-facts.json
+            out/assessment.json
+            out/parity.json
+            out/rollback-parity.json
+          if-no-files-found: warn
